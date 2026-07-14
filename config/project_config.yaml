@@ -1,0 +1,26 @@
+# Geospatial & Feature Engineering Configurations
+spatial:
+  h3_resolution: 4
+
+features:
+  num_quantile_buckets: 100
+  embedding_dim: 128
+  sequence_length: 7  # base_distance, base_eta, sinuosity, elevation_gain, elevation_loss, terrain_ratio, driver_eff
+
+# Neural Network Architecture Configurations
+model:
+  linformer_layers: 4
+  attention_heads: 8
+  projection_ratio_k: 16
+  mlp_hidden_dims: [1024, 512, 256]
+  dropout: 0.1
+
+# Optimization & Multi-Task Parameters
+training:
+  batch_size: 64
+  learning_rate: 0.0005
+  epochs: 15
+  quantiles: [0.50, 0.95, 0.99]
+  alpha: 1.0   # Weight for P50 Loss
+  beta: 1.5    # Weight for P95 Loss
+  gamma: 2.0   # Weight for P99 Loss
