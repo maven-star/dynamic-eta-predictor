@@ -1,409 +1,456 @@
-from fastapi import FastAPI, Form
-from fastapi.responses import HTMLResponse
+"""FastAPI application for route ETA prediction."""
+
+from __future__ import annotations
+
+import hashlib
+import html
+import json
+import os
+import threading
+import time
+from datetime import datetime
+from dataclasses import dataclass
+from math import cos, pi
+from pathlib import Path
+from typing import Any
+
+import h3
 import requests
 import torch
-import uuid
-import json
+from fastapi import FastAPI, Form, HTTPException
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field, ValidationError
 
+from src.config import load_project_config
+from src.data_collection.realtime_provider import LiveRoute, Place, ProviderError, TomTomRealtimeProvider
+from src.data_collection.trip_store import TripStore
 from src.models.deepreta_system import DeeprETAEndToEndSystem
 
-app = FastAPI()
+ROOT = Path(__file__).resolve().parents[2]
+MODEL_PATH = Path(os.getenv("ETA_MODEL_PATH", ROOT / "src/models/deepreta_trained.pth"))
+REQUEST_TIMEOUT_SECONDS = 10
+settings = load_project_config()
+SAMPLE_POINTS = settings.sequence_length
+NOMINATIM_INTERVAL_SECONDS = 1.0
+USER_AGENT = os.getenv("ETA_USER_AGENT", "dynamic-eta-predictor/1.0 (local demo)")
+TOMTOM_API_KEY = os.getenv("TOMTOM_API_KEY", "").strip()
+TRIP_DB_PATH = Path(os.getenv("ETA_TRIP_DB_PATH", ROOT / "data/eta_events.sqlite3"))
+CALIBRATION_REQUESTED = os.getenv("ETA_MODEL_CALIBRATED", "false").lower() == "true"
+MODEL_REPORT_PATH = Path(os.getenv("ETA_MODEL_REPORT_PATH", str(MODEL_PATH.with_suffix(".metrics.json"))))
 
-MODEL_PATH = "src/models/deepreta_trained.pth"
+app = FastAPI(title="Dynamic ETA Predictor", version="1.0.0")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-try:
-    model = DeeprETAEndToEndSystem()
-    model.load_state_dict(torch.load(MODEL_PATH, map_location=device))
-    model.to(device)
-    model.eval()
-    print(f"✅ Loaded DeeprETA weights from: {MODEL_PATH}")
-except Exception as e:
-    print(f"❌ Failed to load weights: {e}")
-    model = None
+
+def _load_model() -> DeeprETAEndToEndSystem:
+    model = DeeprETAEndToEndSystem(
+        vocab_size=settings.h3_vocab_size,
+        h3_dim=settings.h3_embedding_dim,
+        continuous_dim=settings.continuous_embedding_dim,
+        max_seq_len=settings.sequence_length,
+        embed_dim=settings.embedding_dim,
+        linformer_k=settings.linformer_projection_k,
+    )
+    state = torch.load(MODEL_PATH, map_location=device, weights_only=True)
+    model.load_state_dict(state)
+    return model.to(device).eval()
 
 
-def geocode_city(city_name: str, headers: dict) -> tuple:
-    geo_url = "https://nominatim.openstreetmap.org/search"
-    res = requests.get(
-        geo_url,
-        params={"q": city_name, "format": "json", "limit": 1},
-        headers=headers,
-    ).json()
-    if not res:
-        raise ValueError(f"Could not find coordinates for '{city_name}'")
-    return float(res[0]["lat"]), float(res[0]["lon"])
+def _checkpoint_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as checkpoint:
+        for block in iter(lambda: checkpoint.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 
-def reverse_geocode_town(lat: float, lon: float, headers: dict) -> str:
-    """Finds the city, town, or district name for a lat/lon point."""
-    rev_url = "https://nominatim.openstreetmap.org/reverse"
+def _load_calibration_status() -> tuple[bool, str]:
+    """Require an eligible report bound cryptographically to this checkpoint."""
+    if not CALIBRATION_REQUESTED:
+        return False, "learned quantiles disabled until ETA_MODEL_CALIBRATED=true"
     try:
-        res = requests.get(
-            rev_url,
-            params={"lat": lat, "lon": lon, "format": "json", "zoom": 10},
-            headers=headers,
-            timeout=2,
-        ).json()
-        address = res.get("address", {})
-        return (
-            address.get("city")
-            or address.get("town")
-            or address.get("state_district")
-            or address.get("county")
-            or ""
+        report = json.loads(MODEL_REPORT_PATH.read_text(encoding="utf-8"))
+        schema_version = report["schema_version"]
+        expected_hash = report["checkpoint"]["sha256"]
+        eligible = report["promotion"]["eligible"]
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        return False, f"calibration report unavailable or invalid: {error}"
+    if schema_version != 1:
+        return False, "calibration report schema is not supported"
+    if eligible is not True:
+        return False, "calibration report did not pass promotion gates"
+    try:
+        if not isinstance(expected_hash, str) or _checkpoint_sha256(MODEL_PATH) != expected_hash:
+            return False, "calibration report does not match the configured checkpoint"
+    except OSError as error:
+        return False, f"unable to verify checkpoint checksum: {error}"
+    return True, "eligible chronological test report verified"
+
+
+try:
+    model: DeeprETAEndToEndSystem | None = _load_model()
+    model_load_error: str | None = None
+except Exception as error:
+    model = None
+    model_load_error = str(error)
+
+MODEL_CALIBRATED, model_calibration_status = _load_calibration_status()
+
+
+class RouteRequest(BaseModel):
+    origin: str = Field(min_length=2, max_length=160)
+    destination: str = Field(min_length=2, max_length=160)
+    speed_multiplier: float = Field(default=1.0, ge=0.5, le=1.5)
+    harsh_braking: float = Field(default=1.0, ge=0.0, le=10.0)
+    aggressive_acceleration: float = Field(default=1.0, ge=0.0, le=10.0)
+    vehicle_type: str = Field(default="unknown", min_length=1, max_length=64)
+    request_type: str = Field(default="mountain_trip", min_length=1, max_length=64)
+
+
+class PositionEventRequest(BaseModel):
+    occurred_at: datetime
+    latitude: float = Field(ge=-90, le=90)
+    longitude: float = Field(ge=-180, le=180)
+    speed_kph: float | None = Field(default=None, ge=0, le=250)
+    heading_degrees: float | None = Field(default=None, ge=0, lt=360)
+    source: str = Field(default="manual", min_length=1, max_length=32)
+
+
+class CompletionRequest(BaseModel):
+    completed_at: datetime
+    actual_duration_minutes: float = Field(gt=0, le=10_080)
+    source: str = Field(default="manual", min_length=1, max_length=32)
+
+
+@dataclass(frozen=True)
+class Route:
+    distance_km: float
+    base_duration_minutes: float
+    coordinates: list[list[float]]
+    free_flow_minutes: float | None = None
+    traffic_delay_minutes: float | None = None
+    provider: str = "osrm_static"
+
+
+class PublicRouteClient:
+    """Bounded public-service client with Nominatim pacing and caching."""
+
+    def __init__(self) -> None:
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json"})
+        self._cache: dict[tuple[str, str], tuple[float, Any]] = {}
+        self._lock = threading.Lock()
+        self._last_nominatim_at = 0.0
+
+    def get(self, namespace: str, key: str, url: str, params: dict[str, Any], ttl: int = 900) -> Any:
+        cache_key = (namespace, key)
+        with self._lock:
+            cached = self._cache.get(cache_key)
+            if cached and time.monotonic() - cached[0] < ttl:
+                return cached[1]
+        try:
+            response = self.session.get(url, params=params, timeout=REQUEST_TIMEOUT_SECONDS)
+            response.raise_for_status()
+            payload = response.json()
+        except (requests.RequestException, ValueError) as error:
+            raise HTTPException(status_code=503, detail=f"Upstream {namespace} service is unavailable") from error
+        with self._lock:
+            self._cache[cache_key] = (time.monotonic(), payload)
+        return payload
+
+    def geocode(self, location: str) -> tuple[float, float, str]:
+        query = location.strip()
+        cache_key = f"search:{query.casefold()}"
+        with self._lock:
+            cached = self._cache.get(("geocoding", cache_key))
+            delay = 0.0 if cached else NOMINATIM_INTERVAL_SECONDS - (time.monotonic() - self._last_nominatim_at)
+        if delay > 0:
+            time.sleep(delay)
+        payload = self.get("geocoding", cache_key, "https://nominatim.openstreetmap.org/search", {"q": query, "format": "jsonv2", "limit": 1}, ttl=3600)
+        with self._lock:
+            self._last_nominatim_at = time.monotonic()
+        if not payload:
+            raise HTTPException(status_code=422, detail=f"Could not geocode '{query}'")
+        first = payload[0]
+        return float(first["lat"]), float(first["lon"]), str(first["display_name"])
+
+    def route(self, origin: tuple[float, float], destination: tuple[float, float]) -> Route:
+        lat_o, lon_o = origin
+        lat_d, lon_d = destination
+        payload = self.get(
+            "routing", f"{lat_o:.5f},{lon_o:.5f}:{lat_d:.5f},{lon_d:.5f}",
+            f"https://router.project-osrm.org/route/v1/driving/{lon_o},{lat_o};{lon_d},{lat_d}",
+            {"overview": "full", "geometries": "geojson"},
         )
-    except Exception:
-        return ""
+        routes = payload.get("routes", [])
+        if not routes:
+            raise HTTPException(status_code=422, detail="No drivable route was found")
+        route = routes[0]
+        duration = float(route["duration"]) / 60.0
+        return Route(float(route["distance"]) / 1000.0, duration, [[float(lat), float(lon)] for lon, lat in route["geometry"]["coordinates"]], duration, 0.0, "osrm_static")
 
 
-def get_osrm_route(
-    lat_org: float, lon_org: float, lat_dst: float, lon_dst: float, headers: dict
-) -> tuple:
-    osrm_url = (
-        f"http://router.project-osrm.org/route/v1/driving/"
-        f"{lon_org},{lat_org};{lon_dst},{lat_dst}"
-        f"?overview=full&geometries=geojson"
-    )
-    res = requests.get(osrm_url).json()
+class RouteFeatureProvider:
+    """Derive the model's six real features from sampled route geometry."""
 
-    if "routes" in res and res["routes"]:
-        route = res["routes"][0]
-        distance_km = round(route["distance"] / 1000.0, 1)
-        geometry = route["geometry"]["coordinates"]
-        route_coords = [[pt[1], pt[0]] for pt in geometry]
+    def __init__(self, client: PublicRouteClient) -> None:
+        self.client = client
 
-        # Break down route into key intermediate stops (sampling 4 intermediate points)
-        num_points = len(route_coords)
-        intermediate_names = []
+    @staticmethod
+    def sample(coordinates: list[list[float]], count: int = SAMPLE_POINTS) -> list[list[float]]:
+        if not coordinates:
+            raise ValueError("route geometry is empty")
+        if len(coordinates) <= count:
+            return coordinates
+        return [coordinates[round(index * (len(coordinates) - 1) / (count - 1))] for index in range(count)]
 
-        if num_points > 10:
-            sample_indices = [
-                int(num_points * 0.2),
-                int(num_points * 0.4),
-                int(num_points * 0.6),
-                int(num_points * 0.8),
-            ]
-            for idx in sample_indices:
-                pt = route_coords[idx]
-                town = reverse_geocode_town(pt[0], pt[1], headers)
-                if town and (
-                    not intermediate_names or town != intermediate_names[-1]
-                ):
-                    intermediate_names.append(town)
+    def elevations(self, points: list[list[float]]) -> list[float]:
+        latitudes = ",".join(f"{lat:.5f}" for lat, _ in points)
+        longitudes = ",".join(f"{lon:.5f}" for _, lon in points)
+        try:
+            payload = self.client.get("elevation", latitudes + ":" + longitudes, "https://api.open-meteo.com/v1/elevation", {"latitude": latitudes, "longitude": longitudes}, ttl=86400)
+            values = payload.get("elevation", [])
+            if len(values) == len(points):
+                return [float(value) for value in values]
+        except HTTPException:
+            pass
+        return [0.0] * len(points)
 
-        return distance_km, route_coords, intermediate_names
-
-    return 250.0, [[lat_org, lon_org], [lat_dst, lon_dst]], []
-
-
-def latlng_to_mock_h3(lat: float, lng: float) -> str:
-    return "8826801431fffff"
-
-
-def predict_eta_with_nn(origin: str, destination: str) -> dict:
-    o = origin.strip().title()
-    d = destination.strip().title()
-
-    headers = {"User-Agent": f"deepreta_app_{uuid.uuid4().hex[:8]}"}
-
-    lat_org, lon_org = geocode_city(o, headers)
-    lat_dst, lon_dst = geocode_city(d, headers)
-    distance_km, route_coords, waypoints = get_osrm_route(
-        lat_org, lon_org, lat_dst, lon_dst, headers
-    )
-
-    # Clean route breakdown: Origin ➔ Waypoints ➔ Destination
-    clean_origin = o.split(",")[0]
-    clean_dest = d.split(",")[0]
-
-    filtered_waypoints = [
-        w
-        for w in waypoints
-        if w.lower() not in clean_origin.lower()
-        and w.lower() not in clean_dest.lower()
-    ]
-
-    route_breakdown = [clean_origin] + filtered_waypoints + [clean_dest]
-    route_breakdown_str = " ➔ ".join(route_breakdown)
-
-    h3_base = latlng_to_mock_h3(lat_org, lon_org)
-    h3_strings = [h3_base] * 8
-    continuous_features = torch.full(
-        (8, 6), fill_value=10, dtype=torch.long
-    ).to(device)
-    driver_profile = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32).to(
-        device
-    )
-
-    with torch.no_grad():
-        if model is not None:
-            predicted_quantiles = model.predict_eta(
-                h3_strings=h3_strings,
-                continuous_features=continuous_features,
-                driver_profile=driver_profile,
+    def weather(self, latitude: float, longitude: float) -> tuple[float, float, float, float]:
+        try:
+            payload = self.client.get(
+                "weather", f"{latitude:.2f},{longitude:.2f}", "https://api.open-meteo.com/v1/forecast",
+                {"latitude": latitude, "longitude": longitude, "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,precipitation"}, ttl=600,
             )
+            current = payload.get("current", {})
+            return (float(current.get("temperature_2m", 20.0)), float(current.get("relative_humidity_2m", 60.0)), float(current.get("wind_speed_10m", 10.0)), float(current.get("precipitation", 0.0)))
+        except HTTPException:
+            return (20.0, 60.0, 10.0, 0.0)
 
-            pred_values = predicted_quantiles.cpu().numpy().flatten()
-            raw_p10, raw_p50, raw_p90 = (
-                pred_values[0],
-                pred_values[1],
-                pred_values[2],
+    @staticmethod
+    def grade(previous: list[float], current: list[float], previous_elevation: float, elevation: float) -> float:
+        lat1, lon1 = previous
+        lat2, lon2 = current
+        north_m = (lat2 - lat1) * 111_320.0
+        east_m = (lon2 - lon1) * 111_320.0 * cos((lat1 + lat2) * 0.5 * pi / 180.0)
+        run = max((north_m * north_m + east_m * east_m) ** 0.5, 1.0)
+        return max(-30.0, min(30.0, (elevation - previous_elevation) / run * 100.0))
+
+    def build(self, route: Route) -> tuple[list[str], torch.Tensor]:
+        points = self.sample(route.coordinates)
+        elevations = self.elevations(points)
+        cells, features = [], []
+        for index, (latitude, longitude) in enumerate(points):
+            weather = self.weather(latitude, longitude)
+            grade = 0.0 if index == 0 else self.grade(points[index - 1], points[index], elevations[index - 1], elevations[index])
+            cell = h3.latlng_to_cell(latitude, longitude, settings.h3_resolution) if hasattr(h3, "latlng_to_cell") else h3.geo_to_h3(latitude, longitude, settings.h3_resolution)
+            cells.append(cell)
+            features.append([elevations[index], grade, *weather])
+        return cells, torch.tensor(features, dtype=torch.float32)
+
+
+route_client = PublicRouteClient()
+feature_provider = RouteFeatureProvider(route_client)
+tomtom_provider = TomTomRealtimeProvider(TOMTOM_API_KEY) if TOMTOM_API_KEY else None
+trip_store = TripStore(TRIP_DB_PATH)
+
+
+def resolve_route(
+    origin: str, destination: str, origin_coordinates: tuple[float, float] | None = None
+) -> tuple[Route, str, str]:
+    """Use live traffic whenever a TomTom key is configured."""
+    if tomtom_provider is not None:
+        try:
+            origin_place = (
+                Place(origin_coordinates[0], origin_coordinates[1], "Latest vehicle position")
+                if origin_coordinates is not None
+                else tomtom_provider.geocode(origin)
             )
-            base_time_mins = (distance_km / 60.0) * 60
+            destination_place = tomtom_provider.geocode(destination)
+            live: LiveRoute = tomtom_provider.calculate_route(origin_place, destination_place)
+            return (
+                Route(live.distance_km, live.travel_time_minutes, live.coordinates, live.free_flow_minutes, live.traffic_delay_minutes, live.provider),
+                origin_place.label,
+                destination_place.label,
+            )
+        except ProviderError as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+    if origin_coordinates is not None:
+        origin_lat, origin_lon, origin_name = origin_coordinates[0], origin_coordinates[1], "Latest vehicle position"
+    else:
+        origin_lat, origin_lon, origin_name = route_client.geocode(origin)
+    destination_lat, destination_lon, destination_name = route_client.geocode(destination)
+    return route_client.route((origin_lat, origin_lon), (destination_lat, destination_lon)), origin_name, destination_name
 
-            eta_10 = int(max(1, base_time_mins * raw_p10))
-            eta_50 = int(max(eta_10 + 1, base_time_mins * raw_p50))
-            eta_90 = int(max(eta_50 + 1, base_time_mins * raw_p90))
-        else:
-            raise RuntimeError("Model weights not loaded.")
 
+def predict_route(
+    request: RouteRequest, origin_coordinates: tuple[float, float] | None = None
+) -> dict[str, Any]:
+    route, origin_name, destination_name = resolve_route(request.origin, request.destination, origin_coordinates)
+    if model is None:
+        raise HTTPException(status_code=503, detail="ETA model is unavailable; see /health")
+    # Every inference uses live route geometry, H3 cells, terrain and weather.
+    # TomTom's traffic-aware duration is the base time; the network predicts
+    # ordered route-condition multipliers around that real-time baseline.
+    cells, features = feature_provider.build(route)
+    driver = torch.tensor(
+        [request.speed_multiplier, request.harsh_braking, request.aggressive_acceleration], dtype=torch.float32
+    )
+    with torch.inference_mode():
+        multipliers = model.predict_eta(cells, features, driver).detach().cpu().tolist()
+    raw_quantiles = [max(1, round(route.base_duration_minutes * float(multiplier))) for multiplier in multipliers]
+    if MODEL_CALIBRATED:
+        quantiles = raw_quantiles
+        model_status = "calibrated model quantiles; chronological test report verified"
+    else:
+        # Never let an unvalidated checkpoint claim a faster median than the
+        # live routing provider. This safety anchor prevents the synthetic
+        # bundled model from turning a 10-hour mountain route into 2 hours.
+        baseline = max(1, round(route.base_duration_minutes))
+        quantiles = [max(1, round(baseline * 0.80)), baseline, round(baseline * 1.30)]
+        model_status = f"baseline-anchored intervals; {model_calibration_status}"
+    flow = None
+    if tomtom_provider is not None:
+        try:
+            flow = tomtom_provider.flow_at(*route.coordinates[0])
+        except ProviderError:
+            flow = None
     return {
-        "origin": o,
-        "destination": d,
-        "route_breakdown": route_breakdown_str,
-        "origin_coords": [lat_org, lon_org],
-        "destination_coords": [lat_dst, lon_dst],
-        "distance": f"{distance_km} km",
-        "route_coords": route_coords,
-        "eta_10": f"{eta_10 // 60}h {eta_10 % 60}m"
-        if eta_10 >= 60
-        else f"{eta_10} mins",
-        "eta_50": f"{eta_50 // 60}h {eta_50 % 60}m"
-        if eta_50 >= 60
-        else f"{eta_50} mins",
-        "eta_90": f"{eta_90 // 60}h {eta_90 % 60}m"
-        if eta_90 >= 60
-        else f"{eta_90} mins",
+        "origin": origin_name,
+        "destination": destination_name,
+        "distance_km": round(route.distance_km, 1),
+        "eta_minutes": {"p10": quantiles[0], "p50": quantiles[1], "p90": quantiles[2]},
+        "traffic_baseline_minutes": round(route.base_duration_minutes),
+        "free_flow_minutes": round(route.free_flow_minutes) if route.free_flow_minutes is not None else None,
+        "traffic_delay_minutes": round(route.traffic_delay_minutes) if route.traffic_delay_minutes is not None else None,
+        "traffic_available": route.provider == "tomtom_live_traffic",
+        "traffic_flow": None if flow is None else {"current_speed_kph": flow.current_speed_kph, "free_flow_speed_kph": flow.free_flow_speed_kph, "confidence": flow.confidence},
+        "provider": route.provider,
+        "route_coordinates": route.coordinates,
+        "feature_points": len(cells),
+        "feature_snapshot": {
+            "h3_cells": cells,
+            "continuous_features": features.tolist(),
+            "driver_profile": driver.tolist(),
+            "routing_eta_minutes": route.base_duration_minutes,
+            "traffic_delay_minutes": route.traffic_delay_minutes,
+            "vehicle_type": request.vehicle_type,
+            "request_type": request.request_type,
+        },
+        "model_status": model_status,
     }
 
 
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>DeeprETA Route Predictor</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
-    <style>
-        :root {{
-            --bg-body: #f8fafc;
-            --text-main: #0f172a;
-            --text-muted: #64748b;
-            --card-bg: #ffffff;
-            --card-border: #e2e8f0;
-            --input-bg: #f1f5f9;
-            --input-border: #cbd5e1;
-            --input-text: #0f172a;
-            --primary: #4f46e5;
-            --primary-hover: #4338ca;
-            --header-text: #4338ca;
-            
-            --p10-color: #15803d;
-            --p50-color: #1d4ed8;
-            --p90-color: #b91c1c;
-            --card-accent: #4f46e5;
-        }}
+@app.get("/health")
+def health() -> dict[str, Any]:
+    return {
+        "status": "ok" if model is not None else "degraded",
+        "traffic_provider": "tomtom_live_traffic" if tomtom_provider else "osrm_static_fallback",
+        "model_loaded": model is not None,
+        "model_error": model_load_error,
+        "learned_quantiles_enabled": MODEL_CALIBRATED,
+        "calibration_status": model_calibration_status,
+    }
 
-        @media (prefers-color-scheme: dark) {{
-            :root {{
-                --bg-body: #0f172a;
-                --text-main: #f8fafc;
-                --text-muted: #94a3b8;
-                --card-bg: #1e293b;
-                --card-border: #334155;
-                --input-bg: #334155;
-                --input-border: #475569;
-                --input-text: #ffffff;
-                --primary: #6366f1;
-                --primary-hover: #4f46e5;
-                --header-text: #818cf8;
-                
-                --p10-color: #4ade80;
-                --p50-color: #60a5fa;
-                --p90-color: #f87171;
-                --card-accent: #6366f1;
-            }}
-        }}
 
-        body {{
-            background-color: var(--bg-body);
-            color: var(--text-main);
-            font-family: system-ui, -apple-system, sans-serif;
-            transition: background-color 0.3s ease, color 0.3s ease;
-        }}
+@app.post("/api/predict")
+def api_predict(request: RouteRequest) -> dict[str, Any]:
+    prediction = predict_route(request)
+    prediction.pop("feature_snapshot", None)
+    return prediction
 
-        .card {{
-            background-color: var(--card-bg);
-            border: 1px solid var(--card-border);
-            border-radius: 12px;
-            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.05);
-        }}
 
-        .brand-title {{ color: var(--header-text); }}
+@app.post("/api/trips")
+def create_trip(request: RouteRequest) -> dict[str, Any]:
+    """Create a labelled-trip candidate and return its first quantile ETA."""
+    import uuid
 
-        .btn-primary {{
-            background-color: var(--primary);
-            border: none;
-            color: #ffffff;
-        }}
-        .btn-primary:hover {{ background-color: var(--primary-hover); }}
+    prediction = predict_route(request)
+    trip_id = str(uuid.uuid4())
+    feature_snapshot = prediction.pop("feature_snapshot")
+    trip_store.create_trip(trip_id, request.model_dump(mode="json"), prediction, feature_snapshot)
+    return {"trip_id": trip_id, **prediction}
 
-        .form-control {{
-            background-color: var(--input-bg);
-            border: 1px solid var(--input-border);
-            color: var(--input-text);
-        }}
 
-        .result-card {{ border-left: 4px solid var(--card-accent) !important; }}
-        .text-custom-muted {{ color: var(--text-muted); }}
+@app.post("/api/trips/{trip_id}/positions")
+def record_position(trip_id: str, event: PositionEventRequest) -> dict[str, str]:
+    try:
+        trip_store.add_position(
+            trip_id,
+            event.occurred_at.isoformat(),
+            event.latitude,
+            event.longitude,
+            event.speed_kph,
+            event.heading_degrees,
+            event.source,
+        )
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return {"status": "recorded"}
 
-        .color-p10 {{ color: var(--p10-color); }}
-        .color-p50 {{ color: var(--p50-color); }}
-        .color-p90 {{ color: var(--p90-color); }}
 
-        .badge-route {{
-            background-color: var(--input-bg);
-            color: var(--text-main);
-            border: 1px solid var(--card-border);
-            padding: 8px 12px;
-            border-radius: 8px;
-            font-size: 0.95rem;
-            display: inline-block;
-        }}
+@app.post("/api/trips/{trip_id}/complete")
+def complete_trip(trip_id: str, completion: CompletionRequest) -> dict[str, str]:
+    try:
+        trip_store.complete_trip(
+            trip_id, completion.completed_at.isoformat(), completion.actual_duration_minutes, completion.source
+        )
+    except KeyError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+    return {"status": "completed"}
 
-        #map {{
-            height: 380px;
-            width: 100%;
-            border-radius: 10px;
-            margin-top: 15px;
-            border: 1px solid var(--card-border);
-        }}
-    </style>
-</head>
-<body>
-    <div class="container py-5">
-        <div class="row justify-content-center">
-            <div class="col-lg-7 col-md-9">
-                
-                <div class="card p-4 mb-4">
-                    <h3 class="text-center mb-4 brand-title">🧠 DeeprETA Route Predictor</h3>
-                    <form action="/" method="POST">
-                        <div class="row">
-                            <div class="col-md-6 mb-3">
-                                <label class="form-label">Origin City</label>
-                                <input type="text" name="origin" class="form-control" placeholder="e.g. Delhi" value="{origin}" required>
-                            </div>
-                            <div class="col-md-6 mb-3">
-                                <label class="form-label">Destination City</label>
-                                <input type="text" name="destination" class="form-control" placeholder="e.g. Chandigarh" value="{destination}" required>
-                            </div>
-                        </div>
-                        <button type="submit" class="btn btn-primary w-100 py-2">Query Route & Predict ETA</button>
-                    </form>
-                </div>
 
-                {result_html}
+@app.get("/api/trips/{trip_id}")
+def get_trip(trip_id: str) -> dict[str, Any]:
+    trip = trip_store.get_trip(trip_id)
+    if trip is None:
+        raise HTTPException(status_code=404, detail="trip was not found")
+    return trip
 
-            </div>
-        </div>
-    </div>
 
-    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-    {map_script}
-</body>
-</html>
-"""
+@app.post("/api/trips/{trip_id}/eta")
+def refresh_remaining_eta(trip_id: str) -> dict[str, Any]:
+    """Predict the remaining ETA from the latest persisted vehicle position."""
+    trip = trip_store.get_trip(trip_id)
+    if trip is None:
+        raise HTTPException(status_code=404, detail="trip was not found")
+    if trip["status"] != "active":
+        raise HTTPException(status_code=409, detail="trip is already completed")
+    if not trip["positions"]:
+        raise HTTPException(status_code=409, detail="record at least one vehicle position before refreshing ETA")
+    latest = trip["positions"][-1]
+    request = RouteRequest.model_validate(trip["request"])
+    prediction = predict_route(request, (float(latest["latitude"]), float(latest["longitude"])))
+    prediction.pop("feature_snapshot", None)
+    prediction["trip_id"] = trip_id
+    prediction["position_timestamp"] = latest["occurred_at"]
+    prediction["remaining_eta"] = True
+    return prediction
+
+
+PAGE = """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Dynamic ETA Predictor</title><link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'><style>body{{font-family:system-ui;max-width:800px;margin:2rem auto;padding:0 1rem}}input,button{{padding:.65rem;margin:.2rem}}#map{{height:360px;margin-top:1rem}}.warning{{color:#8a5a00}}</style></head><body><h1>Dynamic ETA Predictor</h1><p>Route-based ETA intervals using OSRM plus a research model.</p><form method='post'><input name='origin' required maxlength='160' placeholder='Origin city' value='{origin}'><input name='destination' required maxlength='160' placeholder='Destination city' value='{destination}'><button>Predict</button></form>{result}<script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>{script}</body></html>"""
+
+
+def format_minutes(minutes: int) -> str:
+    return f"{minutes // 60}h {minutes % 60}m" if minutes >= 60 else f"{minutes} min"
 
 
 @app.get("/", response_class=HTMLResponse)
-async def home():
-    return HTML_TEMPLATE.format(
-        origin="", destination="", result_html="", map_script=""
-    )
+def home() -> str:
+    return PAGE.format(origin="", destination="", result="", script="")
 
 
 @app.post("/", response_class=HTMLResponse)
-async def predict(origin: str = Form(...), destination: str = Form(...)):
+def predict(origin: str = Form(...), destination: str = Form(...)) -> str:
     try:
-        prediction = predict_eta_with_nn(origin, destination)
-
-        result_html = f"""
-        <div class="card p-4 result-card">
-            <h5 class="mb-3 brand-title">Model Output & Travel Route</h5>
-            
-            <div class="mb-3">
-                <div class="text-custom-muted mb-1"><strong>Route Corridor Breakdown:</strong></div>
-                <div class="badge-route">📍 {prediction["route_breakdown"]}</div>
-            </div>
-
-            <div class="mb-3 text-custom-muted">
-                <strong>Real Road Distance:</strong> <span>{prediction["distance"]}</span>
-            </div>
-            
-            <div id="map"></div>
-
-            <hr style="border-color: var(--card-border);" class="my-4">
-            
-            <div class="d-flex justify-content-between mb-2">
-                <span class="color-p10"><strong>10th Percentile (Optimistic):</strong></span>
-                <span class="color-p10"><strong>{prediction["eta_10"]}</strong></span>
-            </div>
-            <div class="d-flex justify-content-between mb-2 fs-5">
-                <span class="color-p50"><strong>50th Percentile (Most Likely):</strong></span>
-                <strong class="color-p50">{prediction["eta_50"]}</strong>
-            </div>
-            <div class="d-flex justify-content-between mb-2">
-                <span class="color-p90"><strong>90th Percentile (Pessimistic):</strong></span>
-                <span class="color-p90"><strong>{prediction["eta_90"]}</strong></span>
-            </div>
-        </div>
-        """
-
-        map_script = f"""
-        <script>
-            const routeCoords = {json.dumps(prediction["route_coords"])};
-            const originCoords = {json.dumps(prediction["origin_coords"])};
-            const destCoords = {json.dumps(prediction["destination_coords"])};
-
-            const map = L.map('map');
-
-            const isDark = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches;
-            const tileUrl = isDark 
-                ? 'https://{{s}}.basemaps.cartocdn.com/dark_all/{{z}}/{{x}}/{{y}}{{r}}.png'
-                : 'https://{{s}}.basemaps.cartocdn.com/rastertiles/voyager/{{z}}/{{x}}/{{y}}{{r}}.png';
-
-            L.tileLayer(tileUrl, {{
-                maxZoom: 19,
-                attribution: '&copy; OpenStreetMap &copy; CARTO'
-            }}).addTo(map);
-
-            const polyline = L.polyline(routeCoords, {{
-                color: isDark ? '#818cf8' : '#4f46e5',
-                weight: 5,
-                opacity: 0.85
-            }}).addTo(map);
-
-            L.marker(originCoords).addTo(map).bindPopup("<b>Origin:</b> {prediction['origin']}");
-            L.marker(destCoords).addTo(map).bindPopup("<b>Destination:</b> {prediction['destination']}");
-
-            map.fitBounds(polyline.getBounds(), {{ padding: [30, 30] }});
-        </script>
-        """
-
-    except Exception as e:
-        result_html = f"""
-        <div class="alert alert-danger p-3" role="alert">
-            <strong>Inference Failure:</strong> {str(e)}
-        </div>
-        """
-        map_script = ""
-
-    return HTML_TEMPLATE.format(
-        origin=origin,
-        destination=destination,
-        result_html=result_html,
-        map_script=map_script,
-    )
+        result = predict_route(RouteRequest(origin=origin, destination=destination))
+        traffic_note = "Live traffic is active." if result["traffic_available"] else "Traffic is unavailable: OSRM static-route fallback is active. Set TOMTOM_API_KEY."
+        delay = "" if result["traffic_delay_minutes"] is None else f" · traffic delay: {format_minutes(result['traffic_delay_minutes'])}"
+        eta = result["eta_minutes"]
+        result_html = f"<h2>{html.escape(result['origin'])} → {html.escape(result['destination'])}</h2><p>{result['distance_km']} km · traffic baseline: {format_minutes(result['traffic_baseline_minutes'])}{delay}</p><p><b>P10:</b> {format_minutes(eta['p10'])} · <b>P50:</b> {format_minutes(eta['p50'])} · <b>P90:</b> {format_minutes(eta['p90'])}</p><p class='warning'>{html.escape(traffic_note)} Model intervals require completed-trip calibration.</p><div id='map'></div>"
+        coordinates = json.dumps(result["route_coordinates"])
+        script = f"<script>const m=L.map('map');const c={coordinates};const p=L.polyline(c).addTo(m);m.fitBounds(p.getBounds(),{{padding:[20,20]}});L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{maxZoom:19,attribution:'© OpenStreetMap'}}).addTo(m);</script>"
+        return PAGE.format(origin=html.escape(origin, quote=True), destination=html.escape(destination, quote=True), result=result_html, script=script)
+    except (HTTPException, ValidationError, ValueError) as error:
+        detail = error.detail if isinstance(error, HTTPException) else str(error)
+        return PAGE.format(origin=html.escape(origin, quote=True), destination=html.escape(destination, quote=True), result=f"<p role='alert'>{html.escape(str(detail))}</p>", script="")

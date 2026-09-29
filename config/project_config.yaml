@@ -1,26 +1,46 @@
 # Geospatial & Feature Engineering Configurations
 spatial:
-  h3_resolution: 4
+  h3_resolution: 7
 
 features:
   num_quantile_buckets: 100
   embedding_dim: 128
-  sequence_length: 7  # base_distance, base_eta, sinuosity, elevation_gain, elevation_loss, terrain_ratio, driver_eff
+  sequence_length: 8
+  continuous_feature_order:
+    - elevation_meters
+    - incline_gradient_pct
+    - temperature_celsius
+    - relative_humidity_pct
+    - wind_speed_kmh
+    - precipitation_mm
 
 # Neural Network Architecture Configurations
 model:
-  linformer_layers: 4
-  attention_heads: 8
-  projection_ratio_k: 16
-  mlp_hidden_dims: [1024, 512, 256]
-  dropout: 0.1
+  h3_vocab_size: 5000
+  h3_embedding_dim: 32
+  continuous_embedding_dim: 16
+  linformer_projection_k: 4
+  embedding_dim: 128
 
 # Optimization & Multi-Task Parameters
 training:
-  batch_size: 64
+  batch_size: 16
   learning_rate: 0.0005
-  epochs: 15
-  quantiles: [0.50, 0.95, 0.99]
-  alpha: 1.0   # Weight for P50 Loss
-  beta: 1.5    # Weight for P95 Loss
-  gamma: 2.0   # Weight for P99 Loss
+  epochs: 30
+  quantiles: [0.10, 0.50, 0.90]
+  # The newest periods are never used to fit or choose model weights.
+  validation_fraction: 0.15
+  test_fraction: 0.15
+  min_train_examples: 100
+  min_evaluation_examples: 20
+
+# A candidate checkpoint is not eligible for live learned quantiles unless the
+# untouched chronological test period meets every gate below. Tune these after
+# establishing a stable, representative mountain-trip data set.
+promotion:
+  max_test_p50_mae_minutes: 60
+  minimum_p50_skill_vs_baseline: 0.0
+  p10_coverage_min: 0.03
+  p10_coverage_max: 0.20
+  p90_coverage_min: 0.80
+  p90_coverage_max: 0.97

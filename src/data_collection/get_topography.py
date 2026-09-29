@@ -38,10 +38,8 @@ class TerrainProfiler:
         # 1. Fetch Elevation Profiles via Batch POST
         lats = df["latitude"].tolist()
         lons = df["longitude"].tolist()
-        payload = {"latitude": lats, "longitude": lons}
-        
         try:
-            response = requests.post(self.api_url, json=payload, timeout=15)
+            response = requests.get(self.api_url, params={"latitude": ",".join(map(str, lats)), "longitude": ",".join(map(str, lons))}, timeout=15)
             if response.status_code == 200:
                 data = response.json()
                 df["elevation_meters"] = data.get("elevation", [0.0] * len(df))

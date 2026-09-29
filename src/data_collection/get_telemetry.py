@@ -9,10 +9,12 @@ class ProductionCorridorDataEngine:
     feature matrices and continuous weather vectors along 10 route intervals.
     """
     def __init__(self):
-        self.routing_url = "http://router.project-osrm.org/route/v1/driving/"
+        self.routing_url = "https://router.project-osrm.org/route/v1/driving/"
         self.weather_url = "https://api.open-meteo.com/v1/forecast"
 
     def fetch_comprehensive_features(self, start_coords, end_coords, sample_points=10):
+        if sample_points < 2:
+            raise ValueError("sample_points must be at least 2")
         print(f"[System] Initiating high-resolution feature extraction ({sample_points} checkpoints)...")
         
         # 1. Capture Real-Time Temporal Context from your machine
@@ -44,8 +46,7 @@ class ProductionCorridorDataEngine:
             params = {
                 "latitude": lat,
                 "longitude": lng,
-                "current_weather": "true",
-                "hourly": "temperature_2m,relativehumidity_2m,windspeed_10m,precipitation"
+                "current": "temperature_2m,relative_humidity_2m,wind_speed_10m,precipitation",
             }
             wx_res = requests.get(self.weather_url, params=params, timeout=10)
             
@@ -54,16 +55,11 @@ class ProductionCorridorDataEngine:
             
             if wx_res.status_code == 200:
                 wx_data = wx_res.json()
-                current_wx = wx_data.get("current_weather", {})
-                temp = current_wx.get("temperature", temp)
-                wind_spd = current_wx.get("windspeed", wind_spd)
-                
-                # Extract the current hour's continuous humidity and precipitation values
-                hourly = wx_data.get("hourly", {})
-                if "relativehumidity_2m" in hourly and len(hourly["relativehumidity_2m"]) > 0:
-                    humidity = hourly["relativehumidity_2m"][current_hour]
-                if "precipitation" in hourly and len(hourly["precipitation"]) > 0:
-                    precip = hourly["precipitation"][current_hour]
+                current_wx = wx_data.get("current", {})
+                temp = current_wx.get("temperature_2m", temp)
+                humidity = current_wx.get("relative_humidity_2m", humidity)
+                wind_spd = current_wx.get("wind_speed_10m", wind_spd)
+                precip = current_wx.get("precipitation", precip)
 
             feature_matrix.append({
                 "checkpoint_pct": f"{pct}%",

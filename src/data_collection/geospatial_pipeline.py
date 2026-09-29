@@ -38,7 +38,7 @@ class IndustryETAFeatureEngine:
         """Queries production global DEM arrays and calculates dynamic slopes without distance assumptions."""
         lats, lons = df["latitude"].tolist(), df["longitude"].tolist()
         try:
-            res = requests.post(self.elevation_api_url, json={"latitude": lats, "longitude": lons}, timeout=15)
+            res = requests.get(self.elevation_api_url, params={"latitude": ",".join(map(str, lats)), "longitude": ",".join(map(str, lons))}, timeout=15)
             df["elevation_meters"] = res.json().get("elevation", [0.0] * len(df)) if res.status_code == 200 else 0.0
         except Exception as e:
             print(f"[Topography Warning] Global DEM lookup failed ({e}). Defaulting baseline.")
