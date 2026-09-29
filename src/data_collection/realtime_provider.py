@@ -79,6 +79,34 @@ class TomTomRealtimeProvider:
         except (KeyError, TypeError, ValueError) as error:
             raise ProviderError("TomTom returned an incomplete geocoding result") from error
 
+    def search_places(self, query: str, limit: int = 6) -> list[Place]:
+        """Return distinct, user-selectable places for an origin/destination field."""
+        normalized_query = query.strip()
+        if len(normalized_query) < 2:
+            return []
+        payload = self._get(
+            f"/search/2/search/{quote(normalized_query)}.json",
+            {"limit": max(1, min(limit, 10)), "typeahead": "true"},
+        )
+        places: list[Place] = []
+        seen: set[tuple[float, float, str]] = set()
+        for result in payload.get("results", []):
+            position = result.get("position", {})
+            address = result.get("address", {})
+            poi = result.get("poi", {})
+            try:
+                latitude, longitude = float(position["lat"]), float(position["lon"])
+                address_label = str(address.get("freeformAddress") or "").strip()
+                poi_name = str(poi.get("name") or "").strip()
+            except (KeyError, TypeError, ValueError):
+                continue
+            label = ", ".join(part for part in (poi_name, address_label) if part) or f"{latitude:.5f}, {longitude:.5f}"
+            key = (round(latitude, 6), round(longitude, 6), label.casefold())
+            if key not in seen:
+                seen.add(key)
+                places.append(Place(latitude, longitude, label))
+        return places
+
     def calculate_route(self, origin: Place, destination: Place) -> LiveRoute:
         locations = f"{origin.latitude},{origin.longitude}:{destination.latitude},{destination.longitude}"
         payload = self._get(

@@ -17,9 +17,9 @@ from typing import Any
 import h3
 import requests
 import torch
-from fastapi import FastAPI, Form, HTTPException
+from fastapi import FastAPI, Form, HTTPException, Query
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from src.config import load_project_config
 from src.data_collection.realtime_provider import LiveRoute, Place, ProviderError, TomTomRealtimeProvider
@@ -100,11 +100,26 @@ MODEL_CALIBRATED, model_calibration_status = _load_calibration_status()
 class RouteRequest(BaseModel):
     origin: str = Field(min_length=2, max_length=160)
     destination: str = Field(min_length=2, max_length=160)
+    origin_latitude: float | None = Field(default=None, ge=-90, le=90)
+    origin_longitude: float | None = Field(default=None, ge=-180, le=180)
+    destination_latitude: float | None = Field(default=None, ge=-90, le=90)
+    destination_longitude: float | None = Field(default=None, ge=-180, le=180)
+    origin_label: str | None = Field(default=None, min_length=2, max_length=200)
+    destination_label: str | None = Field(default=None, min_length=2, max_length=200)
     speed_multiplier: float = Field(default=1.0, ge=0.5, le=1.5)
     harsh_braking: float = Field(default=1.0, ge=0.0, le=10.0)
     aggressive_acceleration: float = Field(default=1.0, ge=0.0, le=10.0)
     vehicle_type: str = Field(default="unknown", min_length=1, max_length=64)
     request_type: str = Field(default="mountain_trip", min_length=1, max_length=64)
+
+    @model_validator(mode="after")
+    def _require_complete_selected_places(self) -> "RouteRequest":
+        for field_name in ("origin", "destination"):
+            latitude = getattr(self, f"{field_name}_latitude")
+            longitude = getattr(self, f"{field_name}_longitude")
+            if (latitude is None) != (longitude is None):
+                raise ValueError(f"{field_name} latitude and longitude must be provided together")
+        return self
 
 
 class PositionEventRequest(BaseModel):
@@ -159,20 +174,35 @@ class PublicRouteClient:
         return payload
 
     def geocode(self, location: str) -> tuple[float, float, str]:
+        places = self.search_places(location, limit=1)
+        if not places:
+            raise HTTPException(status_code=422, detail=f"Could not geocode '{location}'")
+        place = places[0]
+        return place.latitude, place.longitude, place.label
+
+    def search_places(self, location: str, limit: int = 6) -> list[Place]:
         query = location.strip()
+        if len(query) < 2:
+            return []
         cache_key = f"search:{query.casefold()}"
         with self._lock:
             cached = self._cache.get(("geocoding", cache_key))
             delay = 0.0 if cached else NOMINATIM_INTERVAL_SECONDS - (time.monotonic() - self._last_nominatim_at)
         if delay > 0:
             time.sleep(delay)
-        payload = self.get("geocoding", cache_key, "https://nominatim.openstreetmap.org/search", {"q": query, "format": "jsonv2", "limit": 1}, ttl=3600)
+        payload = self.get(
+            "geocoding", cache_key, "https://nominatim.openstreetmap.org/search",
+            {"q": query, "format": "jsonv2", "limit": max(1, min(limit, 10)), "addressdetails": 1}, ttl=3600,
+        )
         with self._lock:
             self._last_nominatim_at = time.monotonic()
-        if not payload:
-            raise HTTPException(status_code=422, detail=f"Could not geocode '{query}'")
-        first = payload[0]
-        return float(first["lat"]), float(first["lon"]), str(first["display_name"])
+        places: list[Place] = []
+        for result in payload:
+            try:
+                places.append(Place(float(result["lat"]), float(result["lon"]), str(result["display_name"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return places
 
     def route(self, origin: tuple[float, float], destination: tuple[float, float]) -> Route:
         lat_o, lon_o = origin
@@ -256,17 +286,26 @@ trip_store = TripStore(TRIP_DB_PATH)
 
 
 def resolve_route(
-    origin: str, destination: str, origin_coordinates: tuple[float, float] | None = None
+    origin: str,
+    destination: str,
+    origin_coordinates: tuple[float, float] | None = None,
+    destination_coordinates: tuple[float, float] | None = None,
+    origin_label: str | None = None,
+    destination_label: str | None = None,
 ) -> tuple[Route, str, str]:
     """Use live traffic whenever a TomTom key is configured."""
     if tomtom_provider is not None:
         try:
             origin_place = (
-                Place(origin_coordinates[0], origin_coordinates[1], "Latest vehicle position")
+                Place(origin_coordinates[0], origin_coordinates[1], origin_label or "Latest vehicle position")
                 if origin_coordinates is not None
                 else tomtom_provider.geocode(origin)
             )
-            destination_place = tomtom_provider.geocode(destination)
+            destination_place = (
+                Place(destination_coordinates[0], destination_coordinates[1], destination_label or destination)
+                if destination_coordinates is not None
+                else tomtom_provider.geocode(destination)
+            )
             live: LiveRoute = tomtom_provider.calculate_route(origin_place, destination_place)
             return (
                 Route(live.distance_km, live.travel_time_minutes, live.coordinates, live.free_flow_minutes, live.traffic_delay_minutes, live.provider),
@@ -276,17 +315,39 @@ def resolve_route(
         except ProviderError as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
     if origin_coordinates is not None:
-        origin_lat, origin_lon, origin_name = origin_coordinates[0], origin_coordinates[1], "Latest vehicle position"
+        origin_lat, origin_lon, origin_name = origin_coordinates[0], origin_coordinates[1], origin_label or "Latest vehicle position"
     else:
         origin_lat, origin_lon, origin_name = route_client.geocode(origin)
-    destination_lat, destination_lon, destination_name = route_client.geocode(destination)
+    if destination_coordinates is not None:
+        destination_lat, destination_lon, destination_name = (
+            destination_coordinates[0], destination_coordinates[1], destination_label or destination
+        )
+    else:
+        destination_lat, destination_lon, destination_name = route_client.geocode(destination)
     return route_client.route((origin_lat, origin_lon), (destination_lat, destination_lon)), origin_name, destination_name
 
 
 def predict_route(
     request: RouteRequest, origin_coordinates: tuple[float, float] | None = None
 ) -> dict[str, Any]:
-    route, origin_name, destination_name = resolve_route(request.origin, request.destination, origin_coordinates)
+    selected_origin = origin_coordinates or (
+        (request.origin_latitude, request.origin_longitude)
+        if request.origin_latitude is not None and request.origin_longitude is not None
+        else None
+    )
+    selected_destination = (
+        (request.destination_latitude, request.destination_longitude)
+        if request.destination_latitude is not None and request.destination_longitude is not None
+        else None
+    )
+    route, origin_name, destination_name = resolve_route(
+        request.origin,
+        request.destination,
+        selected_origin,
+        selected_destination,
+        "Latest vehicle position" if origin_coordinates is not None else request.origin_label,
+        request.destination_label,
+    )
     if model is None:
         raise HTTPException(status_code=503, detail="ETA model is unavailable; see /health")
     # Every inference uses live route geometry, H3 cells, terrain and weather.
@@ -350,6 +411,25 @@ def health() -> dict[str, Any]:
         "model_error": model_load_error,
         "learned_quantiles_enabled": MODEL_CALIBRATED,
         "calibration_status": model_calibration_status,
+    }
+
+
+@app.get("/api/places")
+def suggest_places(
+    query: str = Query(min_length=2, max_length=160),
+    limit: int = Query(default=6, ge=1, le=10),
+) -> dict[str, Any]:
+    """Return precise selectable places; clients must retain the coordinates."""
+    try:
+        places = tomtom_provider.search_places(query, limit) if tomtom_provider is not None else route_client.search_places(query, limit)
+    except ProviderError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+    return {
+        "provider": "tomtom_search" if tomtom_provider is not None else "nominatim_fallback",
+        "places": [
+            {"label": place.label, "latitude": place.latitude, "longitude": place.longitude}
+            for place in places
+        ],
     }
 
 
@@ -428,7 +508,97 @@ def refresh_remaining_eta(trip_id: str) -> dict[str, Any]:
     return prediction
 
 
-PAGE = """<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Dynamic ETA Predictor</title><link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'><style>body{{font-family:system-ui;max-width:800px;margin:2rem auto;padding:0 1rem}}input,button{{padding:.65rem;margin:.2rem}}#map{{height:360px;margin-top:1rem}}.warning{{color:#8a5a00}}</style></head><body><h1>Dynamic ETA Predictor</h1><p>Route-based ETA intervals using OSRM plus a research model.</p><form method='post'><input name='origin' required maxlength='160' placeholder='Origin city' value='{origin}'><input name='destination' required maxlength='160' placeholder='Destination city' value='{destination}'><button>Predict</button></form>{result}<script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>{script}</body></html>"""
+PAGE = """<!doctype html>
+<html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>
+<title>Dynamic ETA Predictor</title>
+<link rel='stylesheet' href='https://unpkg.com/leaflet@1.9.4/dist/leaflet.css'>
+<style>
+body{font-family:system-ui;max-width:900px;margin:2rem auto;padding:0 1rem;color:#102a43}
+form{display:grid;grid-template-columns:1fr 1fr auto;gap:.65rem;align-items:start}
+label{font-weight:650;font-size:.9rem;display:block;margin-bottom:.25rem}
+input,button{box-sizing:border-box;padding:.7rem;width:100%;font:inherit;border:1px solid #9fb3c8;border-radius:.35rem}
+button{width:auto;background:#1976d2;color:#fff;border:0;cursor:pointer;margin-top:1.65rem}
+small{display:block;min-height:1.25rem;margin-top:.25rem;color:#52606d}.invalid{color:#b42318}.selected{color:#00796b}
+#map{height:360px;margin-top:1rem}.warning{color:#8a5a00}@media(max-width:680px){form{grid-template-columns:1fr}button{margin-top:0;width:100%}}
+</style></head><body>
+<h1>Dynamic ETA Predictor</h1>
+<p>Select an exact pickup and destination place. A city alone is ambiguous; choosing a suggestion stores its coordinates so routing starts at the right location.</p>
+<form id='route-form' method='post'>
+  <div><label for='origin'>Origin / pickup point</label><input id='origin' name='origin' list='origin-options' required maxlength='160' autocomplete='off' placeholder='e.g. Connaught Place, Delhi' value='__ORIGIN__'><datalist id='origin-options'></datalist><input id='origin_latitude' name='origin_latitude' type='hidden'><input id='origin_longitude' name='origin_longitude' type='hidden'><input id='origin_label' name='origin_label' type='hidden'><small id='origin-status'>Start typing, then choose a precise suggestion.</small></div>
+  <div><label for='destination'>Destination / drop point</label><input id='destination' name='destination' list='destination-options' required maxlength='160' autocomplete='off' placeholder='e.g. Leh Main Market' value='__DESTINATION__'><datalist id='destination-options'></datalist><input id='destination_latitude' name='destination_latitude' type='hidden'><input id='destination_longitude' name='destination_longitude' type='hidden'><input id='destination_label' name='destination_label' type='hidden'><small id='destination-status'>Start typing, then choose a precise suggestion.</small></div>
+  <button type='submit'>Predict ETA</button>
+</form>
+__RESULT__
+<script src='https://unpkg.com/leaflet@1.9.4/dist/leaflet.js'></script>
+<script>
+(() => {
+  const fields = ['origin', 'destination'];
+  const timers = {};
+  const status = (name, message, kind = '') => {
+    const node = document.getElementById(`${name}-status`);
+    node.textContent = message;
+    node.className = kind;
+  };
+  const clearSelection = (name) => {
+    for (const suffix of ['latitude', 'longitude', 'label']) document.getElementById(`${name}_${suffix}`).value = '';
+  };
+  const selectSuggestion = (name) => {
+    const input = document.getElementById(name);
+    const option = [...document.getElementById(`${name}-options`).options].find((item) => item.value === input.value);
+    if (!option) { clearSelection(name); status(name, 'Choose one of the suggested precise places.', 'invalid'); return false; }
+    document.getElementById(`${name}_latitude`).value = option.dataset.latitude;
+    document.getElementById(`${name}_longitude`).value = option.dataset.longitude;
+    document.getElementById(`${name}_label`).value = option.value;
+    status(name, `Selected: ${option.value}`, 'selected');
+    return true;
+  };
+  const fetchSuggestions = async (name) => {
+    const input = document.getElementById(name);
+    const query = input.value.trim();
+    if (query.length < 2) { status(name, 'Type at least two characters.', ''); return; }
+    status(name, 'Searching precise places...', '');
+    try {
+      const response = await fetch(`/api/places?query=${encodeURIComponent(query)}&limit=6`);
+      if (!response.ok) throw new Error('place search unavailable');
+      const payload = await response.json();
+      const list = document.getElementById(`${name}-options`);
+      list.replaceChildren();
+      for (const place of payload.places) {
+        const option = document.createElement('option');
+        option.value = place.label;
+        option.dataset.latitude = place.latitude;
+        option.dataset.longitude = place.longitude;
+        list.append(option);
+      }
+      status(name, payload.places.length ? 'Choose a suggestion to lock the exact coordinates.' : 'No precise place found. Try a landmark, neighborhood, or full address.', payload.places.length ? '' : 'invalid');
+    } catch (_) { status(name, 'Place search is unavailable. Try again shortly.', 'invalid'); }
+  };
+  for (const name of fields) {
+    const input = document.getElementById(name);
+    input.addEventListener('input', () => {
+      clearSelection(name);
+      clearTimeout(timers[name]);
+      timers[name] = setTimeout(() => fetchSuggestions(name), 300);
+    });
+    input.addEventListener('change', () => selectSuggestion(name));
+  }
+  document.getElementById('route-form').addEventListener('submit', (event) => {
+    const selected = fields.map(selectSuggestion).every(Boolean);
+    if (!selected) event.preventDefault();
+  });
+})();
+</script>
+__SCRIPT__
+</body></html>"""
+
+
+def render_page(origin: str, destination: str, result: str, script: str) -> str:
+    return (
+        PAGE.replace("__ORIGIN__", html.escape(origin, quote=True))
+        .replace("__DESTINATION__", html.escape(destination, quote=True))
+        .replace("__RESULT__", result)
+        .replace("__SCRIPT__", script)
+    )
 
 
 def format_minutes(minutes: int) -> str:
@@ -437,20 +607,34 @@ def format_minutes(minutes: int) -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def home() -> str:
-    return PAGE.format(origin="", destination="", result="", script="")
+    return render_page("", "", "", "")
 
 
 @app.post("/", response_class=HTMLResponse)
-def predict(origin: str = Form(...), destination: str = Form(...)) -> str:
+def predict(
+    origin: str = Form(...),
+    destination: str = Form(...),
+    origin_latitude: float | None = Form(default=None),
+    origin_longitude: float | None = Form(default=None),
+    destination_latitude: float | None = Form(default=None),
+    destination_longitude: float | None = Form(default=None),
+    origin_label: str | None = Form(default=None),
+    destination_label: str | None = Form(default=None),
+) -> str:
     try:
-        result = predict_route(RouteRequest(origin=origin, destination=destination))
+        result = predict_route(RouteRequest(
+            origin=origin, destination=destination,
+            origin_latitude=origin_latitude, origin_longitude=origin_longitude,
+            destination_latitude=destination_latitude, destination_longitude=destination_longitude,
+            origin_label=origin_label, destination_label=destination_label,
+        ))
         traffic_note = "Live traffic is active." if result["traffic_available"] else "Traffic is unavailable: OSRM static-route fallback is active. Set TOMTOM_API_KEY."
         delay = "" if result["traffic_delay_minutes"] is None else f" · traffic delay: {format_minutes(result['traffic_delay_minutes'])}"
         eta = result["eta_minutes"]
         result_html = f"<h2>{html.escape(result['origin'])} → {html.escape(result['destination'])}</h2><p>{result['distance_km']} km · traffic baseline: {format_minutes(result['traffic_baseline_minutes'])}{delay}</p><p><b>P10:</b> {format_minutes(eta['p10'])} · <b>P50:</b> {format_minutes(eta['p50'])} · <b>P90:</b> {format_minutes(eta['p90'])}</p><p class='warning'>{html.escape(traffic_note)} Model intervals require completed-trip calibration.</p><div id='map'></div>"
         coordinates = json.dumps(result["route_coordinates"])
         script = f"<script>const m=L.map('map');const c={coordinates};const p=L.polyline(c).addTo(m);m.fitBounds(p.getBounds(),{{padding:[20,20]}});L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png',{{maxZoom:19,attribution:'© OpenStreetMap'}}).addTo(m);</script>"
-        return PAGE.format(origin=html.escape(origin, quote=True), destination=html.escape(destination, quote=True), result=result_html, script=script)
+        return render_page(origin, destination, result_html, script)
     except (HTTPException, ValidationError, ValueError) as error:
         detail = error.detail if isinstance(error, HTTPException) else str(error)
-        return PAGE.format(origin=html.escape(origin, quote=True), destination=html.escape(destination, quote=True), result=f"<p role='alert'>{html.escape(str(detail))}</p>", script="")
+        return render_page(origin, destination, f"<p role='alert'>{html.escape(str(detail))}</p>", "")

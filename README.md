@@ -63,6 +63,28 @@ python -m unittest discover -s tests -v
 }
 ```
 
+For an unambiguous pickup or destination, first call `GET /api/places?query=`
+and send the selected suggestion's coordinates back with the prediction. The
+browser UI does this automatically and requires a suggestion to be selected.
+This prevents a broad city name such as `Delhi` from silently becoming the
+wrong pickup location.
+
+```json
+{
+  "origin": "Connaught Place, New Delhi",
+  "origin_latitude": 28.6315,
+  "origin_longitude": 77.2167,
+  "origin_label": "Connaught Place, New Delhi",
+  "destination": "Leh Main Market",
+  "destination_latitude": 34.1526,
+  "destination_longitude": 77.5771,
+  "destination_label": "Leh Main Market"
+}
+```
+
+Latitude and longitude are always supplied as a pair. When coordinates are
+present, the route uses them directly rather than geocoding the text again.
+
 The result includes `eta_minutes.p10`, `eta_minutes.p50`, and
 `eta_minutes.p90`, plus the real-time traffic baseline, free-flow duration,
 traffic delay, a route-origin traffic-flow observation, and the provider used.

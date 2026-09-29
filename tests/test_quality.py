@@ -77,8 +77,12 @@ class ModelQualityTests(unittest.TestCase):
 class ApiSmokeTests(unittest.TestCase):
     def test_health_and_home_are_available_without_upstream_calls(self):
         self.assertIn(health()["status"], {"ok", "degraded"})
-        self.assertIn("Dynamic ETA Predictor", home())
+        page = home()
+        self.assertIn("Dynamic ETA Predictor", page)
+        self.assertIn("Origin / pickup point", page)
+        self.assertIn("/api/places", page)
         self.assertTrue(any(route.path == "/api/predict" for route in app.routes))
+        self.assertTrue(any(route.path == "/api/places" for route in app.routes))
         self.assertEqual(format_minutes(61), "1h 1m")
 
     def test_live_features_are_sent_to_the_quantile_model(self):
@@ -97,7 +101,7 @@ class ApiSmokeTests(unittest.TestCase):
 
         stub = StubModel()
         try:
-            module.resolve_route = lambda origin, destination, origin_coordinates=None: (module.Route(10, 600, [[28.6, 77.2], [28.7, 77.3]], 80, 20, "tomtom_live_traffic"), "Origin", "Destination")
+            module.resolve_route = lambda origin, destination, origin_coordinates=None, destination_coordinates=None, origin_label=None, destination_label=None: (module.Route(10, 600, [[28.6, 77.2], [28.7, 77.3]], 80, 20, "tomtom_live_traffic"), "Origin", "Destination")
             module.feature_provider.build = lambda route: (["cell-a", "cell-b"], torch.ones(2, 6))
             module.model, module.tomtom_provider = stub, None
             module.MODEL_CALIBRATED = False
@@ -107,6 +111,43 @@ class ApiSmokeTests(unittest.TestCase):
         self.assertEqual(result["eta_minutes"], {"p10": 480, "p50": 600, "p90": 780})
         self.assertEqual(stub.cells, ["cell-a", "cell-b"])
         self.assertEqual(tuple(stub.features.shape), (2, 6))
+
+    def test_selected_place_coordinates_bypass_ambiguous_geocoding(self):
+        module = importlib.import_module("src.api.app")
+        original_route, original_builder, original_model, original_tomtom, original_calibrated = (
+            module.resolve_route, module.feature_provider.build, module.model, module.tomtom_provider, module.MODEL_CALIBRATED
+        )
+        captured = {}
+
+        class StubModel:
+            def predict_eta(self, cells, features, driver):
+                return torch.tensor([0.8, 1.0, 1.3])
+
+        def resolve(origin, destination, origin_coordinates=None, destination_coordinates=None, origin_label=None, destination_label=None):
+            captured.update({
+                "origin_coordinates": origin_coordinates, "destination_coordinates": destination_coordinates,
+                "origin_label": origin_label, "destination_label": destination_label,
+            })
+            return module.Route(10, 60, [[28.63, 77.22], [28.61, 77.21]], 60, 0, "tomtom_live_traffic"), origin_label, destination_label
+
+        try:
+            module.resolve_route, module.feature_provider.build, module.model, module.tomtom_provider = resolve, lambda route: (["cell"], torch.ones(1, 6)), StubModel(), None
+            module.MODEL_CALIBRATED = False
+            result = module.predict_route(module.RouteRequest(
+                origin="Delhi", destination="Leh",
+                origin_latitude=28.6315, origin_longitude=77.2167, origin_label="Connaught Place, New Delhi",
+                destination_latitude=34.1526, destination_longitude=77.5771, destination_label="Leh Main Market",
+            ))
+        finally:
+            module.resolve_route, module.feature_provider.build, module.model, module.tomtom_provider, module.MODEL_CALIBRATED = original_route, original_builder, original_model, original_tomtom, original_calibrated
+        self.assertEqual(captured["origin_coordinates"], (28.6315, 77.2167))
+        self.assertEqual(captured["destination_coordinates"], (34.1526, 77.5771))
+        self.assertEqual(result["origin"], "Connaught Place, New Delhi")
+
+    def test_partial_selected_place_coordinates_are_rejected(self):
+        with self.assertRaisesRegex(ValueError, "latitude and longitude"):
+            from src.api.app import RouteRequest
+            RouteRequest(origin="Connaught Place", destination="Leh", origin_latitude=28.63)
 
     def test_calibrated_mode_requires_a_matching_eligible_report(self):
         module = importlib.import_module("src.api.app")
@@ -175,6 +216,18 @@ class LiveProviderTests(unittest.TestCase):
         self.assertEqual(route.traffic_delay_minutes, 30)
         self.assertEqual(flow.current_speed_kph, 35)
         self.assertIn("key", session.calls[0][1])
+
+    def test_tomtom_search_returns_selectable_places(self):
+        session = _FakeSession([{
+            "results": [
+                {"position": {"lat": 28.6315, "lon": 77.2167}, "poi": {"name": "Connaught Place"}, "address": {"freeformAddress": "New Delhi, Delhi"}},
+                {"position": {"lat": 28.6320, "lon": 77.2170}, "address": {"freeformAddress": "Connaught Place, New Delhi"}},
+            ]
+        }])
+        places = TomTomRealtimeProvider("test-key", session=session).search_places("connaught place")
+        self.assertEqual(places[0].label, "Connaught Place, New Delhi, Delhi")
+        self.assertEqual(places[0].latitude, 28.6315)
+        self.assertEqual(session.calls[0][1]["typeahead"], "true")
 
 
 class TripStoreTests(unittest.TestCase):
